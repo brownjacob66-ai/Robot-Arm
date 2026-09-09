@@ -367,7 +367,7 @@ def convert_steps_to_rads(
     b_deg = s_base / SPD_BASE
     s_deg = s_shoulder / SPD_SHOULDER
     e_deg = s_elbow / SPD_ELBOW
-    p_deg = s_pitch / SPD_WRIST_PITCH
+    p_deg = -s_pitch / SPD_WRIST_PITCH
     r_deg = s_roll / SPD_WRIST_ROLL
     
     return [
@@ -611,6 +611,7 @@ class RobotInterface:
         self._sim_force_target = 0.0
         self._sim_force_current = 0.0
         self._sim_move_target = None
+        self._sim_move_start_position = None
         self._sim_move_start_time = None
         self._sim_move_duration_ms = 2000  # Simulate 2-second moves
         
@@ -746,7 +747,7 @@ class RobotInterface:
         if progress < 1.0:
             # Move in progress - interpolate position
             # Linear interpolation from current to target
-            current_pos = self.joint_state.as_list
+            current_pos = self._sim_move_start_position or self.joint_state.as_list
             target_pos = self._sim_move_target
             
             new_pos = [
@@ -774,6 +775,17 @@ class RobotInterface:
             # Generate MOVE_COMPLETE event
             self.latest_event = "MOVE_COMPLETE"
             self._sim_move_target = None
+            self._sim_move_start_position = None
+
+    def _start_simulated_move(self, target_steps: List[int], timeout_sec: float):
+        """
+        Initialize a simulated move so that it completes before the caller's timeout
+        and interpolates from a fixed starting pose.
+        """
+        self._sim_move_target = list(target_steps)
+        self._sim_move_start_position = self.joint_state.as_list.copy()
+        self._sim_move_start_time = time.time()
+        self._sim_move_duration_ms = max(100, min(2000, int(timeout_sec * 800)))
     
     def log(self, message: str):
         """Log a message."""
@@ -876,14 +888,17 @@ class RobotInterface:
         
         if self.simulation_mode:
             # Simulate move
-            self._sim_move_target = [base_steps, shoulder_steps, elbow_steps, pitch_steps, roll_steps]
-            self._sim_move_start_time = time.time()
+            self._start_simulated_move(
+                [base_steps, shoulder_steps, elbow_steps, pitch_steps, roll_steps],
+                timeout_sec
+            )
             
             # Wait for simulated move to complete
             start_time = time.time()
             while time.time() - start_time < timeout_sec:
                 if self.latest_event == "MOVE_COMPLETE":
                     self.latest_event = None  # Clear for next move
+                    self.motion_state = MotionState.IDLE
                     return True
                 time.sleep(0.05)
             
@@ -959,8 +974,10 @@ class RobotInterface:
             self.log("Simulating probe sequence...")
             
             # Move to probe position
-            self._sim_move_target = [base_steps, shoulder_steps, elbow_steps, pitch_steps, roll_steps]
-            self._sim_move_start_time = time.time()
+            self._start_simulated_move(
+                [base_steps, shoulder_steps, elbow_steps, pitch_steps, roll_steps],
+                timeout_sec
+            )
             
             # Simulate probe motion and contact
             start_time = time.time()
@@ -972,6 +989,7 @@ class RobotInterface:
                     
                     # Return current position as probe contact point
                     result = self.joint_state.as_list
+                    self.motion_state = MotionState.IDLE
                     self.log(f"Probe contact detected at steps {result}")
                     return result
                 
@@ -1857,6 +1875,7 @@ class LapidaryRobotGUI(tk.Tk):
         self.abort_flag = False
         self.pause_flag = False
         self.resume_event = threading.Event()
+        self.visual_refresh_ms = 50
         
         # Calibration state
         self.lap_surface_z = 0.0
@@ -1868,6 +1887,7 @@ class LapidaryRobotGUI(tk.Tk):
         
         # Handle window close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(self.visual_refresh_ms, self._refresh_visualization)
         
         self.log("Application ready")
     
@@ -2043,6 +2063,36 @@ class LapidaryRobotGUI(tk.Tk):
         """Update the status display."""
         self.status_var.set(status)
         self.update_idletasks()
+
+    def _get_visualization_stage(self) -> str:
+        """Return the most useful text to show in the visualization title."""
+        if self.grinding_sequence and self.grinding_sequence.current_stage_name:
+            return self.grinding_sequence.current_stage_name
+        return self.status_var.get()
+
+    def _refresh_visualization(self):
+        """Continuously render the current robot pose from the Tk main thread."""
+        if self.visualizer:
+            if self.robot:
+                current_rads = self.robot.get_current_position_rads()
+                force_grams = self.robot.latest_force_grams
+            else:
+                current_rads = [0.0] * 6
+                force_grams = 0.0
+
+            self.visualizer.render(
+                current_rads,
+                current_rads,
+                self.lap_surface_z,
+                self._get_visualization_stage(),
+                force_grams
+            )
+
+            if hasattr(self, "canvas"):
+                self.canvas.draw_idle()
+
+        if self.winfo_exists():
+            self.after(self.visual_refresh_ms, self._refresh_visualization)
     
     # =========================================================================
     # BUTTON CALLBACKS
@@ -2068,7 +2118,11 @@ class LapidaryRobotGUI(tk.Tk):
             self.log(f"Connection failed: {e}")
             return
         
-        self.grinding_sequence = GrindingSequence(self.robot, log_callback=self.log)
+        self.grinding_sequence = GrindingSequence(
+            self.robot,
+            log_callback=self.log,
+            sim_speed_multiplier=10.0 if sim_mode else 1.0
+        )
         
         # Enable machine control buttons
         self.btn_connect.config(state=tk.DISABLED)
@@ -2149,10 +2203,6 @@ class LapidaryRobotGUI(tk.Tk):
             self.set_status("Homed - Ready to Calibrate")
             self.log("✓ Homing complete")
             
-            # Render at home position
-            home_rads = [0.0] * 6
-            self.visualizer.render(home_rads, home_rads, self.lap_surface_z, "Homed")
-            self.canvas.draw_idle()
         else:
             self.set_status("Homing failed")
             self.log("✗ Homing failed or timed out")
@@ -2204,15 +2254,6 @@ class LapidaryRobotGUI(tk.Tk):
             self.set_status(f"Calibrated - Lap at Z={self.lap_surface_z:.1f}mm")
             self.log(f"✓ Calibration complete: Lap surface at Z = {self.lap_surface_z:.2f} mm")
             
-            # Render at probe position
-            self.visualizer.render(
-                probe_rads,
-                probe_rads,
-                self.lap_surface_z,
-                "Probe Contact"
-            )
-            self.canvas.draw_idle()
-        
         except Exception as e:
             self.log(f"✗ Calibration error: {e}")
             self.set_status("Calibration failed")
@@ -2304,18 +2345,6 @@ class LapidaryRobotGUI(tk.Tk):
                         self.log("Face grinding failed")
                         break
                     
-                    # Update visualization
-                    current_rads = self.robot.get_current_position_rads()
-                    self.visualizer.render(
-                        current_rads,
-                        current_rads,
-                        self.lap_surface_z,
-                        f"Completed: P={pitch:.1f}°, R={roll:.1f}°",
-                        self.robot.latest_force_grams
-                    )
-                    self.canvas.draw_idle()
-                    time.sleep(0.1)
-            
             # Return to home position
             if not self.abort_flag:
                 self.log("\nGrinding complete! Returning home...")
